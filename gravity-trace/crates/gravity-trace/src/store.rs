@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use futures::StreamExt;
-use gravity_trace_core::parquet_io::{conform, filter_range, footer_meta, row_groups_in_range};
+use gravity_trace_core::parquet_io::{RankFilter, conform, filter_range, filter_rank, footer_meta, leaf_mask, row_groups_in_range};
 use object_store::path::Path as ObjPath;
 use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
@@ -128,12 +128,26 @@ impl Store {
         ObjectWriter { store: self.clone(), rt: rt.clone(), tmp, upload: None, buf: Vec::new(), bytes: 0 }
     }
 
-    /// Open `obj` as Parquet; `pick` chooses the row groups to read from its footer (`None`: all of them).
-    pub fn open_parquet(&self, rt: &Handle, obj: &Object, pick: impl FnOnce(&ParquetMetaData) -> Option<Vec<usize>>) -> Result<ParquetReader> {
+    /// Open `obj` as Parquet; `pick` chooses the row groups to read from its footer (`None`: all of them),
+    /// `columns` reads only those leaf columns (`None`: all of them).
+    pub fn open_parquet(
+        &self,
+        rt: &Handle,
+        obj: &Object,
+        columns: Option<&[&str]>,
+        pick: impl FnOnce(&ParquetMetaData) -> Option<Vec<usize>>,
+    ) -> Result<ParquetReader> {
         let shown = self.show(&obj.name);
         let reader = ObjectReader { os: self.os.clone(), path: self.path(&obj.name) };
         let b = rt.block_on(ParquetRecordBatchStreamBuilder::new(reader)).context(ReadParquetSnafu { what: shown.clone() })?;
         let meta = footer_meta(b.metadata());
+        let b = match columns {
+            Some(names) => {
+                let mask = leaf_mask(b.metadata(), names, Path::new(&shown)).context(CoreSnafu)?;
+                b.with_projection(mask)
+            }
+            None => b,
+        };
         let b = match pick(b.metadata()) {
             Some(groups) => b.with_row_groups(groups),
             None => b,
@@ -216,13 +230,16 @@ pub struct Scan {
 
 /// The batches of Parquet objects in a store, optionally only the rows whose Int64 `filter.0` lies in
 /// `[filter.1, filter.2)` (row groups outside it are not fetched), conformed to `schema`: what `gt dump` copies and the
-/// Perfetto converter reads ([`gravity_trace_core::chrome::BatchSource`]).
+/// Perfetto converter reads ([`gravity_trace_core::chrome::BatchSource`]). `columns` reads only those leaf columns;
+/// `rank` keeps only the rows of the selected CUDA devices and their processes (`gt dump --rank`).
 pub struct Batches<'a> {
     pub store: &'a Store,
     pub rt: &'a Handle,
     pub objects: &'a [Object],
     pub filter: Option<(&'static str, i64, i64)>,
     pub schema: Option<SchemaRef>,
+    pub columns: Option<&'a [&'a str]>,
+    pub rank: Option<&'a RankFilter>,
     pub scan: Scan,
 }
 
@@ -233,7 +250,7 @@ impl Batches<'_> {
         for o in self.objects {
             let label = PathBuf::from(self.store.show(&o.name));
             let (mut groups, mut skipped) = (0, 0);
-            let mut r = self.store.open_parquet(self.rt, o, |md| {
+            let mut r = self.store.open_parquet(self.rt, o, self.columns, |md| {
                 let all = || ((0..md.num_row_groups()).collect::<Vec<_>>(), 0);
                 let (keep, sk) = match filter {
                     Some((c, lo, hi)) => row_groups_in_range(md, c, lo, hi).unwrap_or_else(all),
@@ -248,6 +265,13 @@ impl Batches<'_> {
             while let Some(b) = r.next_batch()? {
                 let b = match filter {
                     Some((c, lo, hi)) => filter_range(&b, c, lo, hi, &label).context(CoreSnafu)?,
+                    None => b,
+                };
+                if b.num_rows() == 0 {
+                    continue;
+                }
+                let b = match &self.rank {
+                    Some(rf) => filter_rank(&b, rf, &label).context(CoreSnafu)?,
                     None => b,
                 };
                 if b.num_rows() == 0 {

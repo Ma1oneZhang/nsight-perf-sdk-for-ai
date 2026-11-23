@@ -106,6 +106,7 @@ GT_DAEMON_LISTEN=                                   # "" is a value (no HTTP ser
 |---|---|
 | `[collect] duration_s` | collection time; after it the daemon finishes its files and exits (0 = until stopped) |
 | `[collect] snapshot_ms`, `storage`, `data_rate_mib`, ... | the `gt exporter` flags of the same names |
+| `[collect] ranks` | only these CUDA devices (ranks, comma-separated: `0,2,3`) reach the trace, the stream, /metrics and captures: their GPU activities, the API calls of the processes running on them, and their GPUs' PM samples; `[]` = every device |
 | `[persist] enabled` | write every activity to `persist.dir` (else only `/metrics` and captures) |
 | `[persist] format` | `parquet` (default; `gt dump` reads it) or `perfetto` (`.json.gz` files for ui.perfetto.dev) |
 | `[persist] rotate_s`, `max_disk_gib` | new file every N s; oldest files deleted beyond the limit |
@@ -137,6 +138,10 @@ GT_DAEMON_LISTEN=                                   # "" is a value (no HTTP ser
   be `now-10m`, epoch s / ms / us / ns, `2026-11-16 10:00` (local), `2026-11-16T10:00:00Z`, `10:00:00+08:00`
   (today), and the end also `+5m`. When the range reaches past the newest file and the daemon is running, the daemon
   is asked to close its open file first; the last snapshot interval is not merged yet.
+- **`--rank 0,2,3`** restricts a dump to these ranks (the trace's `device_id`, the SDK's `cudevice_ordinal`,
+  comma-separated): the GPU activities on those devices, and the API calls of the processes seen running on them
+  (a pid scan of the picked files first, reading only the `pid` / `device_id` columns). PM samples are per GPU and
+  are not filtered.
 
 Measured with `bench/daemon_check.sh` (GPU cluster, service on 2 GPUs, synthetic CUDA-graph load on one GPU at ~770 K
 activities/s for 75 s, `max_cpus = 4`, `rotate_s = 20`):

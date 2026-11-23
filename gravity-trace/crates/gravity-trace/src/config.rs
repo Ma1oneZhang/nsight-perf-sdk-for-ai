@@ -12,6 +12,7 @@
 //! `GT_COLLECT_DIAG_FILE` unsets it. A `GT_<SECTION>_...` variable that names no key is an error, like a typo in the
 //! file.
 use crate::error::{BadConfigSnafu, BadEnvSnafu, ParseConfigSnafu, ReadConfigSnafu, Result};
+use crate::ranks::Ranks;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::BTreeMap;
@@ -83,6 +84,10 @@ pub struct Collect {
     pub shards: u32,
     /// Providers not to decode: "gpu_pm", "gpu_hwt", "cuda_api", "nvtx".
     pub ignore: Vec<String>,
+    /// Only these ranks (CUDA device numbers, comma-separated: "0,2,3") reach the trace, the stream, /metrics and
+    /// captures: their GPU activities, the API calls of the processes running on them, and their GPUs' PM samples.
+    /// [] = every device.
+    pub ranks: Vec<String>,
     /// Kernels per process and kind exported individually in /metrics (the rest folded into `<other>`).
     pub top: usize,
     /// Append one JSON line of diagnostics per snapshot to this file.
@@ -103,6 +108,7 @@ impl Default for Collect {
             max_attach_mib: 1024,
             shards: 0,
             ignore: Vec::new(),
+            ranks: Vec::new(),
             top: 50,
             diag_file: None,
             host_proc: "/proc".into(),
@@ -435,6 +441,9 @@ impl Config {
         check(c.data_rate_mib > 0, "collect.data_rate_mib must be positive")?;
         let known = c.ignore.join(",").split(',').map(str::trim).filter(|p| !p.is_empty()).all(|p| PROVIDERS.contains(&p));
         check(known, "collect.ignore: use gpu_pm, gpu_hwt, cuda_api, nvtx")?;
+        if !c.ranks.is_empty() {
+            Ranks::from_config(&c.ranks).map_err(|e| format!("collect.ranks: {e}"))?;
+        }
         check(p.rotate_s >= 1, "persist.rotate_s must be at least 1")?;
         check(p.max_buffer_mib >= 1, "persist.max_buffer_mib must be at least 1")?;
         check(p.row_group_rows >= 1024, "persist.row_group_rows must be at least 1024")?;
@@ -589,6 +598,7 @@ mod tests {
                 ("GT_PERSIST_ENABLED", "off"),
                 ("GT_PERSIST_FORMAT", "perfetto"),
                 ("GT_COLLECT_IGNORE", "gpu_pm, nvtx"),
+                ("GT_COLLECT_RANKS", "0, 2"),
                 ("GT_COLLECT_DIAG_FILE", "/tmp/diag.jsonl"),
                 ("GT_COLLECT_STORAGE", "disk"),
                 ("GT_DAEMON_LISTEN", ""),
@@ -611,6 +621,7 @@ mod tests {
         assert_eq!(c.persist.format, PersistFormat::Perfetto);
         assert_eq!(c.persist.rotate_s, 30, "keys the environment does not name keep the file's value");
         assert_eq!(c.collect.ignore, ["gpu_pm", "nvtx"]);
+        assert_eq!(c.collect.ranks, ["0", "2"]);
         assert_eq!(c.collect.diag_file.as_deref(), Some(Path::new("/tmp/diag.jsonl")));
         assert_eq!(c.collect.storage, Storage::Disk);
         assert_eq!(c.daemon.listen, "", "an empty string is a value");
@@ -618,7 +629,7 @@ mod tests {
         assert_eq!(c.flightsql.columns["cluster"], "gpu-cluster-1");
         assert_eq!(c.flightsql.password, "pw");
         assert_eq!(c.flightsql.compression, Compression::Zstd);
-        assert_eq!(applied.len(), 13);
+        assert_eq!(applied.len(), 14);
         assert!(applied.windows(2).all(|w| w[0] < w[1]), "sorted: {applied:?}");
 
         let (c, applied) = parse_with_env("[collect]\ndiag_file = \"/d.jsonl\"\n", env(&[("GT_COLLECT_DIAG_FILE", "")])).expect("valid");
@@ -647,6 +658,8 @@ mod tests {
         named(err(&[("GT_DAEMON_PID_FILE", "/x"), ("GT_COLLECT_IGNORE", "[1")]), "GT_COLLECT_IGNORE");
         // valid on its own, not as a whole: the message names the variables
         assert!(matches!(err(&[("GT_PERSIST_ZSTD_LEVEL", "40")]), ConfigError::Invalid(m) if m.contains("GT_PERSIST_ZSTD_LEVEL")));
+        assert!(matches!(err(&[("GT_COLLECT_RANKS", "x")]), ConfigError::Invalid(m) if m.contains("collect.ranks")));
+        assert!(matches!(parse("[collect]\nranks = [\"1-3\"]\n"), Err(ConfigError::Invalid(m)) if m.contains("collect.ranks")));
         // the file's own errors come first and point into the file
         assert!(matches!(parse_with_env("[persist]\nrotate = 5\n", env(&[("GT_PERSIST_DIR", "/x")])), Err(ConfigError::Toml(_))));
     }

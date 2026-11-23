@@ -42,6 +42,9 @@ pub enum Error {
     #[snafu(display("invalid duration `{input}` (examples: 5s, 500ms, 1m, 2h)"))]
     BadDuration { input: String },
 
+    #[snafu(display("invalid rank list `{input}` (comma-separated CUDA device numbers, e.g. 0,2,3)"))]
+    BadRank { input: String },
+
     #[snafu(display("cannot create directory {}", path.display()))]
     CreateDir { path: PathBuf, source: std::io::Error },
 

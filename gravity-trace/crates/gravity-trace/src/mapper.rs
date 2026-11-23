@@ -436,6 +436,13 @@ pub struct Mapper {
     gpu_col_u: Vec<Option<usize>>,
     /// Processes whose CPU-side rows only this shard gets.
     excl: FxHashSet<u64>,
+    /// Rank filter (`--rank`): only these CUDA devices (cudevice_ordinal) reach the trace; their processes
+    /// (rank_sel) are handed to the merge, which also keeps their API calls.
+    pub ranks: Option<Vec<u32>>,
+    /// gpu uuid -> cudevice_ordinal, learned from the GPU activity rows (for PM samples and deferred updates).
+    rank_dev: FxHashMap<Uuid, u32>,
+    /// Processes with GPU activity on a selected device.
+    pub rank_sel: FxHashSet<u64>,
 }
 
 /// Per graph executable (diag only), see [`SnapDiag::graph_node_expected`].
@@ -590,6 +597,9 @@ impl Mapper {
             cpu_t: Vec::new(),
             gpu_col_u: Vec::new(),
             excl: FxHashSet::default(),
+            ranks: None,
+            rank_dev: FxHashMap::default(),
+            rank_sel: FxHashSet::default(),
         };
         m.init_routing(s.tables.len(), s.updates.len());
         Ok(m)
@@ -645,6 +655,40 @@ impl Mapper {
         (true, self.cpu_rows)
     }
 
+    /// Rank filter: learn the GPU's device and keep the GPU-side row when its device is selected (or no filter
+    /// runs). A row whose device is missing is kept but never selects its process.
+    fn rank_gpu(&mut self, puid: u64, gpu: Uuid, dev: Option<u32>) -> bool {
+        if let Some(d) = dev {
+            self.rank_dev.insert(gpu, d);
+        }
+        let Some(r) = &self.ranks else { return true };
+        match dev {
+            None => true,
+            Some(d) if r.contains(&d) => {
+                self.rank_sel.insert(puid);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// A deferred GPU-time update / graph launch of a GPU already known to be filtered out (unknown: keep; the
+    /// device is learned from the GPU's first activity row).
+    fn rank_live(&self, gpu: Uuid) -> bool {
+        match (&self.ranks, self.rank_dev.get(&gpu)) {
+            (Some(r), Some(&d)) => r.contains(&d),
+            _ => true,
+        }
+    }
+
+    /// A PM sample of a GPU whose device is known (an idle GPU's samples are dropped while the filter is on).
+    fn rank_pm(&self, gpu: Uuid) -> bool {
+        match (&self.ranks, self.rank_dev.get(&gpu)) {
+            (None, _) => true,
+            (Some(r), d) => d.is_some_and(|&x| r.contains(&x)),
+        }
+    }
+
     fn intern(&mut self, s: &str) -> Arc<str> {
         if let Some(a) = self.names.get(s) {
             return a.clone();
@@ -657,6 +701,11 @@ impl Mapper {
     /// The host pid of a process (its unique id when the process row is missing).
     fn pid(&self, puid: u64) -> u32 {
         self.procs.get(&puid).map(|p| p.pid).unwrap_or(puid as u32)
+    }
+
+    /// The selected processes of the rank filter as host pids (their API calls belong to the trace).
+    pub fn rank_pids(&self) -> Vec<u32> {
+        self.rank_sel.iter().map(|&p| self.pid(p)).collect()
     }
 
     /// The pid in the process's own PID namespace.
@@ -733,6 +782,10 @@ impl Mapper {
                     if let Some(c) = self.snap_upds.get_mut(update) {
                         *c += 1;
                     }
+                }
+                // The deferred GPU times of a device the rank filter drops are useless here.
+                if keep && gpu_col.is_some_and(|gc| !self.rank_live(uuid_at(values, gc))) {
+                    return;
                 }
                 if keep {
                     self.on_update(update, values, out);
@@ -825,6 +878,9 @@ impl Mapper {
                 gpu_ns: u64_at(v, c[7]),
             };
             let gpu = uuid_at(v, c[1]);
+            if !self.rank_live(gpu) {
+                return;
+            }
             self.diag.glaunch_rows += 1;
             if self.diag_on && self.seen_row(key_hash((2u8, p, gpu, hw))) {
                 self.gexec.entry((p, exec)).or_default().launches += 1;
@@ -848,6 +904,9 @@ impl Mapper {
             let c = self.cmd_c.idx;
             let (Some(p), Some(sr)) = (u64_at(v, c[0]), u64_at(v, c[3])) else { return };
             let gpu = uuid_at(v, c[1]);
+            if !self.rank_gpu(p, gpu, low32(u64_at(v, c[2]))) {
+                return;
+            }
             let er = u64_at(v, c[4]).unwrap_or(0);
             let name = self.intern(str_at(v, c[11]).unwrap_or("?"));
             let lname = name.to_ascii_lowercase();
@@ -923,9 +982,13 @@ impl Mapper {
             self.gpus.insert(gpu, (str_at(v, c[1]).unwrap_or("").to_string(), str_at(v, c[2]).unwrap_or("").to_string()));
         } else if t == self.metric_c.table && self.keep_pm {
             let c = self.metric_c.idx;
+            let gpu = uuid_at(v, c[0]);
+            if !self.rank_pm(gpu) {
+                return;
+            }
             if let (Some(end), Some(m), Some(val)) = (u64_at(v, c[1]), str_at(v, c[2]), v.get(c[3]).and_then(Value::f64)) {
                 let metric = self.intern(m);
-                self.pm.push(PmSample { gpu: uuid_at(v, c[0]), end_utc_ns: end, metric, value: val });
+                self.pm.push(PmSample { gpu, end_utc_ns: end, metric, value: val });
             }
         }
     }
@@ -950,6 +1013,9 @@ impl Mapper {
         let c = self.kern_c.idx;
         let Some(p) = u64_at(v, c[0]) else { return };
         let gpu = uuid_at(v, c[1]);
+        if !self.rank_gpu(p, gpu, low32(u64_at(v, c[2]))) {
+            return;
+        }
         let name = self.kernel_name(p, u64_at(v, c[7]));
         let act = Activity {
             kind: EventKind::Kernel,
@@ -1002,6 +1068,9 @@ impl Mapper {
         let c = self.node_c.idx;
         let (Some(p), Some(nc)) = (u64_at(v, c[0]), u64_at(v, c[3])) else { return };
         let gpu = uuid_at(v, c[1]);
+        if !self.rank_gpu(p, gpu, low32(u64_at(v, c[2]))) {
+            return;
+        }
         let start_gpu = u64_at(v, c[4]).unwrap_or(0);
         let name = self.kernel_name(p, u64_at(v, c[5]));
         let (exec, node) = self.gnodes.get(&(p, nc)).copied().unwrap_or((0, nc));
@@ -1713,6 +1782,53 @@ mod tests {
             r.row("cuda_driver_api_calls", &[("process_id_unique", Value::U64(1)), ("start_utc_ns", Value::U64(5)), ("end_utc_ns", Value::U64(6))])
         });
         assert_eq!(r.m.stats.driver_api, 1);
+    }
+
+    #[test]
+    fn rank_filter_keeps_the_selected_devices_and_learns_processes() {
+        const OTHER: [u8; 16] = [9; 16];
+        let mut r = Run::new();
+        r.m.ranks = Some(vec![0]);
+        let kernel = |hw: u64, puid: u64, gpu: Uuid, dev: u64| {
+            (
+                "cuda_immediate_kernel_launches",
+                vec![
+                    ("process_id_unique", Value::U64(puid)),
+                    ("gpu_uuid", Value::Uuid(gpu)),
+                    ("cudevice_ordinal", Value::U64(dev)),
+                    ("hw_correlation_id", Value::U64(hw)),
+                    ("gpu_start_utc_ns", Value::U64(100)),
+                    ("gpu_end_utc_ns", Value::U64(200)),
+                ],
+            )
+        };
+        r.snapshot(|r| {
+            let (t, kv) = kernel(7, 1, GPU, 0);
+            r.row(t, &kv);
+            let (t, kv) = kernel(8, 2, OTHER, 1);
+            r.row(t, &kv);
+            // PM: device 0's GPU is known now; the unknown one is dropped with the filter on.
+            r.row("gpu_metrics", &[("gpu_uuid", Value::Uuid(GPU)), ("gpu_end_utc_ns", Value::U64(300)), ("metric_name", Value::Str("gr")), ("metric_value", Value::F64(1.0))]);
+            r.row("gpu_metrics", &[("gpu_uuid", Value::Uuid([3; 16])), ("gpu_end_utc_ns", Value::U64(300)), ("metric_name", Value::Str("gr")), ("metric_value", Value::F64(1.0))]);
+        });
+        assert_eq!(r.times(), vec![(100, 200)], "only the kernel of device 0");
+        assert_eq!(r.m.pm.len(), 1, "only the PM sample of device 0's (active, selected) GPU");
+        assert!(r.m.rank_sel.contains(&1) && !r.m.rank_sel.contains(&2));
+        // A deferred update of the dropped GPU does not make it in either.
+        r.snapshot(|r| {
+            r.update(
+                "cuda_immediate_kernel_launch_gpu_times",
+                &[
+                    ("process_id_unique", Value::U64(2)),
+                    ("gpu_uuid", Value::Uuid(OTHER)),
+                    ("hw_correlation_id", Value::U64(8)),
+                    ("gpu_start_utc_ns", Value::U64(100)),
+                    ("gpu_end_utc_ns", Value::U64(200)),
+                ],
+            );
+        });
+        assert_eq!(r.times(), vec![(100, 200)]);
+        assert!(!r.m.rank_sel.contains(&2));
     }
 
     #[test]

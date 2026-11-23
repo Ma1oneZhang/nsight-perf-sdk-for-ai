@@ -14,6 +14,7 @@ use crate::host;
 use crate::mapper::{self, Activity, MapStats, Mapper, PmSample};
 use crate::persist::{self, FlushReport, PersistOptions, PersistStats};
 use crate::prom;
+use crate::ranks::Ranks;
 use gravity_trace_core::agg::Aggregator;
 use gravity_trace_core::metrics::Metrics;
 use gravity_trace_core::model::{EventKind, ProcessInfo};
@@ -49,6 +50,9 @@ struct ShardOut {
     procs: Vec<ProcessInfo>,
     gpus: Vec<([u8; 16], String)>,
     pm: Vec<PmSample>,
+    /// Processes with activity on a rank-filter device (mapper.ranks), resolved to host pids: their API
+    /// calls (no device of their own) belong to the trace. Empty when no rank filter runs.
+    sel_pids: Vec<u32>,
     pending: usize,
     stats: MapStats,
     /// The snapshot manifest's flags (the same in every shard).
@@ -82,6 +86,7 @@ impl Sink for ShardSink {
                 procs: m.procs.values().cloned().collect(),
                 gpus: m.gpus.iter().map(|(u, (_, d))| (*u, d.clone())).collect(),
                 pm: std::mem::take(&mut m.pm),
+                sel_pids: m.rank_pids(),
                 pending: m.pending(),
                 stats: m.stats.clone(),
                 history_truncated: m.diag.history_truncated,
@@ -159,6 +164,10 @@ struct LiveSink {
     /// Drives the object store of capture files.
     rt: tokio::runtime::Handle,
     host_proc: PathBuf,
+    /// Rank filter (`--rank`): GPU rows are already filtered by the mappers; the API calls of the processes
+    /// seen on the selected devices (`sel_pids`, cumulative) pass too.
+    ranks: Option<Ranks>,
+    sel_pids: rustc_hash::FxHashSet<u32>,
 }
 
 /// Time the SDK stopped reading the service before this snapshot's successor could start.
@@ -263,7 +272,11 @@ impl LiveSink {
             let gpus = o.gpus.into_iter().filter(|(u, d)| self.gpus.get(u) != Some(d)).collect();
             let names = feed::Names { procs: self.new_processes(o.procs), gpus };
             self.send_names(names);
+            self.sel_pids.extend(o.sel_pids);
             for a in o.acts {
+                if !a.kind.is_gpu() && self.ranks.is_some() && !self.sel_pids.contains(&a.pid) {
+                    continue;
+                }
                 self.record(&a);
                 if let Some(r) = self.recorder.as_mut() {
                     r.offer(&a);
@@ -473,6 +486,9 @@ pub struct PipelineConfig {
     pub diag: Option<PathBuf>,
     /// The host's procfs, for process titles ([`crate::proctitle`]).
     pub host_proc: PathBuf,
+    /// Only these CUDA devices (ranks), their processes' API calls and their GPUs' PM samples
+    /// (`--rank` / `[collect] ranks`); `None` = every device.
+    pub ranks: Option<Ranks>,
     /// Write every activity to disk ([`crate::persist`]).
     pub persist: Option<PersistOptions>,
     /// Stream every activity to a Flight SQL server ([`crate::flight`]).
@@ -579,6 +595,7 @@ pub async fn start(cfg: PipelineConfig) -> Result<Pipeline> {
         let mut mapper = Mapper::new(schema)?;
         mapper.keep_pm = true;
         mapper.diag_on = cfg.diag.is_some();
+        mapper.ranks = cfg.ranks.as_ref().map(|r| r.devices().to_vec());
         let slot = Arc::new(Mutex::new(None));
         slots.push(slot.clone());
         shards.push(Box::new(ShardSink { mapper, acts: Vec::new(), t_begin: None, slot }));
@@ -623,6 +640,8 @@ pub async fn start(cfg: PipelineConfig) -> Result<Pipeline> {
         feeds,
         rt,
         host_proc: cfg.host_proc.clone(),
+        ranks: cfg.ranks.clone(),
+        sel_pids: Default::default(),
     };
     let (tx, rx) = mpsc::sync_channel::<MergeJob>(4);
     let merger = std::thread::Builder::new()
@@ -660,6 +679,9 @@ pub async fn start(cfg: PipelineConfig) -> Result<Pipeline> {
         cfg.live.snapshot_ms,
         if in_memory { "in memory".to_string() } else { format!("in {}", cfg.live.work_dir.display()) }
     );
+    if let Some(r) = &cfg.ranks {
+        eprintln!("gt: rank filter: CUDA devices {r} (with their processes' API calls and their GPUs' PM samples)");
+    }
     if let Some(p) = &cfg.persist {
         eprintln!(
             "gt: persisting every activity to {} as {} (new file every {} s, write buffer {} MiB = {:.1} M activities)",

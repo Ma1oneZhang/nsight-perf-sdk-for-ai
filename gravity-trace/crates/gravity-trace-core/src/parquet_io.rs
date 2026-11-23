@@ -23,6 +23,7 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
+use rustc_hash::FxHashSet;
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -283,6 +284,63 @@ pub fn filter_range(batch: &RecordBatch, column: &str, lo: i64, hi: i64, path: &
     arrow_select::filter::filter_record_batch(batch, &mask).context(ArrowSnafu { context: format!("filtering {}", path.display()) })
 }
 
+/// A projection of the named top-level columns, for reading a batch of only those (a pid scan before
+/// [`filter_rank`] needs `pid`, `device_id` and the time-filter column only, not the whole trace).
+pub fn leaf_mask(md: &ParquetMetaData, names: &[&str], path: &Path) -> Result<parquet::arrow::ProjectionMask> {
+    let descr = md.file_metadata().schema_descr();
+    let mut idx = Vec::with_capacity(names.len());
+    for n in names {
+        let i = descr
+            .columns()
+            .iter()
+            .position(|c| c.name() == *n)
+            .context(WrongTableSnafu { path: path.to_path_buf(), expected: "trace", column: (*n).to_string() })?;
+        idx.push(i);
+    }
+    Ok(parquet::arrow::ProjectionMask::leaves(descr, idx))
+}
+
+/// The rows of a trace batch belonging to a rank selection (CUDA device ordinals): GPU rows by `device_id`,
+/// API calls (no device) by `pid` of the processes seen on the selected devices ([`collect_rank_pids`]).
+#[derive(Clone, Debug, Default)]
+pub struct RankFilter {
+    /// CUDA device ordinals kept.
+    pub devices: Vec<u32>,
+    /// Processes with GPU activity on `devices` in the scanned range (their API calls are kept too).
+    pub pids: FxHashSet<u32>,
+}
+
+fn u32col<'a>(batch: &'a RecordBatch, expected: &'static str, column: &'static str, path: &Path) -> Result<&'a arrow_array::UInt32Array> {
+    batch
+        .column_by_name(column)
+        .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>())
+        .context(WrongTableSnafu { path: path.to_path_buf(), expected, column })
+}
+
+/// Into `pids`: the processes of `batch` with GPU activity on `devices` (what [`filter_rank`] keeps besides the
+/// GPU rows themselves). GPU rows are the ones with a `device_id`.
+pub fn collect_rank_pids(batch: &RecordBatch, devices: &[u32], pids: &mut FxHashSet<u32>, path: &Path) -> Result<()> {
+    use arrow_array::Array;
+    let (pid, dev) = (u32col(batch, "trace", "pid", path)?, u32col(batch, "trace", "device_id", path)?);
+    for i in 0..batch.num_rows() {
+        if dev.is_valid(i) && devices.contains(&dev.value(i)) {
+            pids.insert(pid.value(i));
+        }
+    }
+    Ok(())
+}
+
+/// The rows of `batch` that belong to `f`: GPU rows with `device_id` in `f.devices`, and rows without a
+/// `device_id` (API calls) with `pid` in `f.pids`.
+pub fn filter_rank(batch: &RecordBatch, f: &RankFilter, path: &Path) -> Result<RecordBatch> {
+    use arrow_array::{Array, BooleanArray};
+    let (pid, dev) = (u32col(batch, "trace", "pid", path)?, u32col(batch, "trace", "device_id", path)?);
+    let mask: BooleanArray = (0..batch.num_rows())
+        .map(|i| Some(if dev.is_valid(i) { f.devices.contains(&dev.value(i)) } else { f.pids.contains(&pid.value(i)) }))
+        .collect();
+    arrow_select::filter::filter_record_batch(batch, &mask).context(ArrowSnafu { context: format!("filtering {}", path.display()) })
+}
+
 /// `batch` with the columns (by name) and types of `schema`: files written by other versions may order or type
 /// columns differently.
 pub fn conform(batch: &RecordBatch, schema: &SchemaRef, path: &Path) -> Result<RecordBatch> {
@@ -440,5 +498,63 @@ mod tests {
             .flat_map(|b| b.expect("batch").column_by_name("start_ns").expect("start").as_primitive::<Int64Type>().values().to_vec())
             .collect();
         assert_eq!(starts, vec![100, 99, 98, 97]);
+    }
+
+    #[test]
+    fn rank_filter_keeps_devices_and_their_processes() {
+        let mut b = TraceBatchBuilder::default();
+        let row = |kind, pid, dev, t: i64| TraceRow {
+            kind: Some(kind),
+            name: "x",
+            start_ns: t,
+            end_ns: t + 1,
+            pid,
+            device_id: dev,
+            ..Default::default()
+        };
+        b.push(&row(EventKind::Kernel, 1, Some(0), 10)); // device 0: kept, selects pid 1
+        b.push(&row(EventKind::Kernel, 2, Some(1), 20)); // device 1: dropped
+        b.push(&row(EventKind::Runtime, 1, None, 30));   // pid 1's API call: kept
+        b.push(&row(EventKind::Runtime, 2, None, 40));   // pid 2's API call: dropped
+        b.push(&row(EventKind::Driver, 3, None, 50));    // no device anywhere: dropped
+        let batch = b.finish().expect("batch");
+        let path = Path::new("test.parquet");
+
+        let mut f = RankFilter { devices: vec![0], pids: FxHashSet::default() };
+        collect_rank_pids(&batch, &f.devices, &mut f.pids, path).expect("pids");
+        assert_eq!(f.pids.iter().copied().collect::<Vec<_>>(), vec![1]);
+
+        let out = filter_rank(&batch, &f, path).expect("filter");
+        let starts = out.column_by_name("start_ns").expect("start").as_primitive::<Int64Type>();
+        assert_eq!(starts.values().as_ref(), &[10, 30]);
+
+        // wrong table: no pid column
+        let (pid, dev) = (arrow_array::UInt32Array::from(vec![1]), arrow_array::UInt32Array::from(vec![Some(0)]));
+        let bad = RecordBatch::try_from_iter([
+            ("pid", std::sync::Arc::new(pid) as arrow_array::ArrayRef),
+            ("dev", std::sync::Arc::new(dev) as arrow_array::ArrayRef),
+        ])
+        .expect("batch");
+        let mut pids = FxHashSet::default();
+        assert!(matches!(collect_rank_pids(&bad, &[0], &mut pids, path), Err(crate::error::Error::WrongTable { .. })));
+    }
+
+    #[test]
+    fn leaf_mask_projects_top_level_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trace.parquet");
+        let mut f = ParquetFile::create(path.clone(), trace_schema(), &WriteOptions::default()).expect("create");
+        let mut b = TraceBatchBuilder::default();
+        b.push(&TraceRow { kind: Some(EventKind::Kernel), name: "k", start_ns: 1, end_ns: 2, pid: 1, device_id: Some(0), ..Default::default() });
+        f.write(&b.finish().expect("batch")).expect("write");
+        let out = f.close().expect("close");
+
+        let reader = SerializedFileReader::new(File::open(&out).expect("open")).expect("reader");
+        let md = reader.metadata();
+        let mask = leaf_mask(md, &["pid", "start_ns"], &out).expect("mask");
+        let leaf = |name: &str| md.file_metadata().schema_descr().columns().iter().position(|c| c.name() == name).expect("column");
+        assert!(mask.leaf_included(leaf("pid")) && mask.leaf_included(leaf("start_ns")));
+        assert!(!mask.leaf_included(leaf("name")) && !mask.leaf_included(leaf("end_ns")));
+        assert!(matches!(leaf_mask(md, &["nope"], &out), Err(crate::error::Error::WrongTable { .. })));
     }
 }

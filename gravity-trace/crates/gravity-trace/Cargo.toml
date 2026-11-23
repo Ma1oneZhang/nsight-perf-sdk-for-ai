@@ -28,7 +28,7 @@ libc.workspace = true
 object_store.workspace = true
 parquet.workspace = true
 prost = { workspace = true, optional = true }
-rustc-hash = { workspace = true, optional = true }
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
@@ -51,7 +51,6 @@ monitor = [
     "dep:arrow-ipc",
     "dep:axum",
     "dep:prost",
-    "dep:rustc-hash",
     "dep:tonic",
 ]
 # S3 (and S3-compatible) object stores for persist.dir / captures_dir / gt dump: `s3://bucket/prefix`.

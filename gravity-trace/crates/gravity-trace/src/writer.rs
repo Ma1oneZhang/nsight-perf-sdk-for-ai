@@ -332,7 +332,7 @@ pub fn write_chrome_from(store: &Store, rt: &Handle, src: &mut Batches<'_>, pm: 
 pub fn write_chrome(store: &Store, rt: &Handle, trace: &Written) -> Result<Written> {
     let stem = trace.name.strip_suffix(TRACE_EXT).unwrap_or(&trace.name);
     let objects = [Object { name: trace.name.clone(), size: trace.bytes }];
-    let mut src = Batches { store, rt, objects: &objects, filter: None, schema: None, scan: Default::default() };
+    let mut src = Batches { store, rt, objects: &objects, filter: None, schema: None, columns: None, rank: None, scan: Default::default() };
     write_chrome_from(store, rt, &mut src, None, &format!("{stem}{CHROME_EXT}"))
 }
 

@@ -20,6 +20,7 @@ use crate::error::{BadConfigSnafu, IncompleteSnafu, ListenSnafu, NoDurationSnafu
 use crate::flight::{FlightOptions, FlightReport};
 use crate::live;
 use crate::persist::PersistOptions;
+use crate::ranks::Ranks;
 use crate::timefmt::{fmt_span, fmt_utc, now_ns};
 use snafu::ResultExt;
 use std::fmt::Write as _;
@@ -177,6 +178,8 @@ async fn serve(mode: Mode, c: Config, run: Run) -> Result<()> {
         live: c.live_options(),
         diag: c.collect.diag_file.clone(),
         host_proc: c.collect.host_proc.clone(),
+        // validated when the configuration was loaded ([collect] ranks parses)
+        ranks: Ranks::from_config(&c.collect.ranks).unwrap_or_default(),
         persist,
         flight,
     })

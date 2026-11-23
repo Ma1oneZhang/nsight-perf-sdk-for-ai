@@ -34,6 +34,7 @@ mod dump;
 mod error;
 mod files;
 mod pidfile;
+mod ranks;
 mod store;
 mod timefmt;
 mod writer;
@@ -70,6 +71,8 @@ use crate::error::{BadIgnoreSnafu, JoinSnafu};
 #[cfg(feature = "monitor")]
 use clap::Args;
 use clap::{Parser, Subcommand};
+#[cfg(feature = "monitor")]
+use ranks::Ranks;
 use snafu::ResultExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -147,6 +150,10 @@ enum Cmd {
         /// Configuration file (for persist.dir and the daemon's address).
         #[arg(short, long, env = "GT_CONFIG")]
         config: Option<PathBuf>,
+        /// Only these ranks (CUDA device ids, comma-separated: 0,2,3): their GPU activities and the API calls of
+        /// the processes running on them. PM samples are per GPU and not filtered.
+        #[arg(long)]
+        rank: Option<String>,
         /// Leave the PM samples out (the `.pm.parquet` of a Parquet dump, the counter tracks of a Perfetto one).
         #[arg(long)]
         no_pm: bool,
@@ -299,6 +306,10 @@ struct LiveArgs {
     /// namespace, else the host's /proc mounted read-only.
     #[arg(long, default_value = "/proc")]
     host_proc: PathBuf,
+    /// Only these ranks (CUDA device ids, comma-separated: 0,2,3) reach the pipeline: their GPU activities, the
+    /// API calls of the processes running on them, and their GPUs' PM samples [default: every device].
+    #[arg(long)]
+    rank: Option<String>,
 }
 
 #[cfg(feature = "monitor")]
@@ -380,8 +391,8 @@ async fn run(cmd: Cmd) -> Result<()> {
         #[cfg(feature = "monitor")]
         Cmd::ExportDaemon { .. } | Cmd::Export { .. } | Cmd::Profile { .. } => Ok(()), // handled in main
         #[cfg(feature = "cli")]
-        Cmd::Dump { format, start, end, out, dir, config, no_pm, no_flush, json } => {
-            let a = dump::DumpArgs { format, start, end, dir, out, no_pm, no_flush, json };
+        Cmd::Dump { format, start, end, out, dir, config, rank, no_pm, no_flush, json } => {
+            let a = dump::DumpArgs { format, start, end, dir, out, rank, no_pm, no_flush, json };
             dump::dump_cmd(a, config.as_deref()).await
         }
         #[cfg(feature = "monitor")]
@@ -405,12 +416,28 @@ async fn run(cmd: Cmd) -> Result<()> {
         }
         #[cfg(feature = "monitor")]
         Cmd::Exporter { listen, top, diag, captures_dir, live } => {
-            let pipeline = live::PipelineConfig { top, live: live.options()?, diag, host_proc: live.host_proc.clone(), persist: None, flight: None };
+            let pipeline = live::PipelineConfig {
+                top,
+                live: live.options()?,
+                diag,
+                host_proc: live.host_proc.clone(),
+                ranks: live.rank.as_deref().map(Ranks::parse).transpose()?,
+                persist: None,
+                flight: None,
+            };
             live::exporter(live::ExporterConfig { listen, pipeline, captures_dir }).await
         }
         #[cfg(feature = "monitor")]
         Cmd::Capture { duration, out_dir, no_chrome, json, live } => {
-            let cfg = live::PipelineConfig { top: 50, live: live.options()?, diag: None, host_proc: live.host_proc.clone(), persist: None, flight: None };
+            let cfg = live::PipelineConfig {
+                top: 50,
+                live: live.options()?,
+                diag: None,
+                host_proc: live.host_proc.clone(),
+                ranks: live.rank.as_deref().map(Ranks::parse).transpose()?,
+                persist: None,
+                flight: None,
+            };
             live::capture_cmd(cfg, duration, out_dir, !no_chrome, json).await
         }
         #[cfg(feature = "monitor")]

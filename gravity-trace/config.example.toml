@@ -43,6 +43,10 @@ max_attach_mib = 1024
 shards = 0
 # Providers not to decode: "gpu_pm", "gpu_hwt", "cuda_api", "nvtx".
 ignore = []
+# Only these ranks (CUDA device numbers, comma-separated: 0,2,3) reach the trace, the stream, /metrics and
+# captures: their GPU activities, the API calls of the processes running on them, and their GPUs' PM samples.
+# [] = every device. Same as the --rank flag of `gt exporter` / `gt capture`; `gt dump` has its own --rank.
+ranks = []
 # Kernels per process and kind exported individually in /metrics (the rest folded into <other>).
 top = 50
 # Append one JSON line of diagnostics per snapshot to this file (off when unset).

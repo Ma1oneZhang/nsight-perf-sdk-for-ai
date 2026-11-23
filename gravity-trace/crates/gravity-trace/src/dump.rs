@@ -11,13 +11,15 @@
 use crate::config;
 use crate::error::{BadTimeSnafu, CoreSnafu, EmptyRangeSnafu, JoinSnafu, NoDataSnafu, PerfettoFilesSnafu, Result};
 use crate::files::{self, FileKind, StoredFile};
+use crate::ranks::Ranks;
 use crate::store::{Batches, Object, ObjectWriter, Scan, Store};
 use crate::timefmt::{fmt_span, fmt_utc, now_ns, parse_time};
 use crate::writer::{CHROME_EXT, PM_EXT, TRACE_EXT, Written, pm_schema, span_name, write_chrome_from};
 use gravity_trace_core::chrome::PROCESSES_META;
 use gravity_trace_core::model::ProcessInfo;
-use gravity_trace_core::parquet_io::{TableWriter, WriteOptions};
+use gravity_trace_core::parquet_io::{RankFilter, TableWriter, WriteOptions, collect_rank_pids};
 use gravity_trace_core::schema::trace_schema;
+use rustc_hash::FxHashSet;
 use snafu::{OptionExt, ResultExt, ensure};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +44,8 @@ pub struct DumpArgs {
     pub dir: Option<String>,
     /// Output directory / object store URL, or the output file in it.
     pub out: String,
+    /// Only these ranks (CUDA device ids, comma-separated) and their processes' API calls.
+    pub rank: Option<String>,
     pub no_pm: bool,
     pub no_flush: bool,
     pub json: bool,
@@ -53,6 +57,8 @@ pub struct DumpReport {
     pub start_utc_ns: i64,
     pub end_utc_ns: i64,
     pub dir: String,
+    /// The rank filter, when given (CUDA device ids).
+    pub ranks: Option<Vec<u32>>,
     /// What the daemon answered to `POST /persist/flush`, or why it was not asked.
     pub flush: Option<String>,
     pub trace_files: usize,
@@ -72,8 +78,13 @@ pub async fn dump_cmd(a: DumpArgs, config_path: Option<&Path>) -> Result<()> {
     let start = parse_time(&a.start, now, None).context(BadTimeSnafu { input: a.start.clone() })?;
     let end = parse_time(&a.end, now, Some(start)).context(BadTimeSnafu { input: a.end.clone() })?;
     ensure!(start < end, EmptyRangeSnafu { start: fmt_utc(start), end: fmt_utc(end) });
+    let ranks = a.rank.as_deref().map(Ranks::parse).transpose()?;
     if !a.json {
-        eprintln!("dump {} .. {} ({}) from {dir}", fmt_utc(start), fmt_utc(end), fmt_span(end - start));
+        let what = match &ranks {
+            Some(r) => format!("ranks {r} "),
+            None => String::new(),
+        };
+        eprintln!("dump {} .. {} ({}) {what}from {dir}", fmt_utc(start), fmt_utc(end), fmt_span(end - start));
     }
 
     let store = Store::open(&dir)?;
@@ -110,9 +121,11 @@ pub async fn dump_cmd(a: DumpArgs, config_path: Option<&Path>) -> Result<()> {
     let n_traces = traces.len();
     let (format, rt) = (a.format, Handle::current());
     let src = store.clone();
-    let (scan, written, pm) = tokio::task::spawn_blocking(move || write(format, &src, &rt, &traces, &pms, (start, end), &out, &name))
-        .await
-        .context(JoinSnafu)??;
+    let rs = ranks.clone();
+    let (scan, written, pm) =
+        tokio::task::spawn_blocking(move || write(format, &src, &rt, &traces, &pms, (start, end), &out, &name, rs.as_ref()))
+            .await
+            .context(JoinSnafu)??;
     let Some(written) = written else {
         return NoDataSnafu { dir, start: fmt_utc(start), end: fmt_utc(end), have: coverage(&files) }.fail();
     };
@@ -121,6 +134,7 @@ pub async fn dump_cmd(a: DumpArgs, config_path: Option<&Path>) -> Result<()> {
         start_utc_ns: start,
         end_utc_ns: end,
         dir,
+        ranks: ranks.map(|r| r.devices().to_vec()),
         flush,
         trace_files: n_traces,
         output: written.shown,
@@ -247,6 +261,27 @@ async fn post(addr: &str, path: &str) -> std::result::Result<String, String> {
 
 type Dumped = (Scan, Option<Written>, Option<(Written, u64)>);
 
+/// The processes with GPU activity on the selected devices in `range`, over a pid / device projection of the
+/// picked files (their API calls, which carry no device, belong to the dump too).
+fn select_pids(src: &Store, rt: &Handle, traces: &[Object], range: (i64, i64), ranks: &Ranks) -> Result<FxHashSet<u32>> {
+    let mut pids = FxHashSet::default();
+    let mut b = Batches {
+        store: src,
+        rt,
+        objects: traces,
+        filter: Some(("start_ns", range.0, range.1)),
+        schema: None,
+        columns: Some(&["pid", "device_id", "start_ns"]),
+        rank: None,
+        scan: Scan::default(),
+    };
+    b.each(|path, _, batch| {
+        collect_rank_pids(&batch, ranks.devices(), &mut pids, path).context(CoreSnafu)?;
+        Ok(())
+    })?;
+    Ok(pids)
+}
+
 /// Write the dump (on a blocking thread: the stores are driven through `rt`).
 #[allow(clippy::too_many_arguments)]
 fn write(
@@ -258,6 +293,7 @@ fn write(
     range: (i64, i64),
     out: &Store,
     name: &str,
+    ranks: Option<&Ranks>,
 ) -> Result<Dumped> {
     let meta = BTreeMap::from([
         ("source".to_string(), "gt dump".to_string()),
@@ -265,8 +301,20 @@ fn write(
         ("dump_end_utc_ns".to_string(), range.1.to_string()),
         ("host".to_string(), crate::host()),
     ]);
-    let mut batches =
-        Batches { store: src, rt, objects: traces, filter: Some(("start_ns", range.0, range.1)), schema: Some(trace_schema()), scan: Scan::default() };
+    let rank = match ranks {
+        Some(r) => Some(RankFilter { devices: r.devices().to_vec(), pids: select_pids(src, rt, traces, range, r)? }),
+        None => None,
+    };
+    let mut batches = Batches {
+        store: src,
+        rt,
+        objects: traces,
+        filter: Some(("start_ns", range.0, range.1)),
+        schema: Some(trace_schema()),
+        columns: None,
+        rank: rank.as_ref(),
+        scan: Scan::default(),
+    };
     let written = match format {
         Format::Parquet => {
             let opts = WriteOptions { metadata: meta.clone(), ..WriteOptions::trace() };
@@ -279,6 +327,8 @@ fn write(
                 objects: pms,
                 filter: Some(("end_ns", range.0, range.1)),
                 schema: Some(pm_schema()),
+                columns: None,
+                rank: None,
                 scan: Scan::default(),
             };
             let pm_opt: Option<&mut Batches<'_>> = if pms.is_empty() { None } else { Some(&mut pm_batches) };
@@ -295,7 +345,16 @@ fn write(
     let mut pm = None;
     if format == Format::Parquet && !pms.is_empty() && written.is_some() {
         let pm_name = format!("{}{PM_EXT}", name.strip_suffix(TRACE_EXT).unwrap_or(name));
-        let mut b = Batches { store: src, rt, objects: pms, filter: Some(("end_ns", range.0, range.1)), schema: Some(pm_schema()), scan: Scan::default() };
+        let mut b = Batches {
+            store: src,
+            rt,
+            objects: pms,
+            filter: Some(("end_ns", range.0, range.1)),
+            schema: Some(pm_schema()),
+            columns: None,
+            rank: None,
+            scan: Scan::default(),
+        };
         let opts = WriteOptions { metadata: meta, ..WriteOptions::default() };
         if let Some(w) = copy(&mut b, out, rt, &pm_name, &opts)? {
             pm = Some((w, b.scan.rows));
@@ -404,7 +463,7 @@ mod tests {
         let picked: Vec<Object> = files.iter().filter(|f| f.span.0 < range.1 && f.span.1 >= range.0).map(StoredFile::object).collect();
         assert_eq!(picked.len(), 2, "file 3 is not opened");
         let (_, name) = output(Format::Parquet, &out_dir.path().display().to_string(), range);
-        let (scan, written, pm) = write(Format::Parquet, &store, h, &picked, &[], range, &out, &name).expect("dump");
+        let (scan, written, pm) = write(Format::Parquet, &store, h, &picked, &[], range, &out, &name, None).expect("dump");
         let written = written.expect("rows");
         assert_eq!(written.shown, format!("{}/2500000-3500000.parquet", out_dir.path().display()));
         assert!(pm.is_none());
@@ -413,7 +472,7 @@ mod tests {
         assert_eq!(starts(Path::new(&written.shown)), (2500..3500).map(|t| t * 1000).collect::<Vec<_>>());
 
         let (_, name) = output(Format::Perfetto, &out_dir.path().display().to_string(), range);
-        let (scan, written, _) = write(Format::Perfetto, &store, h, &picked, &[], range, &out, &name).expect("perfetto");
+        let (scan, written, _) = write(Format::Perfetto, &store, h, &picked, &[], range, &out, &name, None).expect("perfetto");
         assert_eq!(scan.rows, 1000);
         let written = written.expect("rows");
         assert_eq!(written.shown, format!("{}/2500000-3500000.json.gz", out_dir.path().display()));
@@ -424,10 +483,64 @@ mod tests {
         assert!(text.contains("\"traceEvents\""));
         assert_eq!(text.matches("\"ph\":\"X\"").count(), 1000, "one event per activity");
 
-        let (_, written, _) = write(Format::Parquet, &store, h, &picked, &[], (1, 2), &out, "empty.parquet").expect("empty");
+        let (_, written, _) = write(Format::Parquet, &store, h, &picked, &[], (1, 2), &out, "empty.parquet", None).expect("empty");
         assert!(written.is_none(), "no rows, no file");
         let left: Vec<_> = std::fs::read_dir(out_dir.path()).expect("ls").flatten().map(|e| e.file_name()).collect();
         assert_eq!(left.len(), 2, "no temporaries: {left:?}");
+    }
+
+    #[test]
+    fn rank_dump_keeps_the_devices_and_their_processes() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().expect("runtime");
+        let h = rt.handle();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&dir.path().display().to_string()).expect("store");
+        // One persisted file: kernels of pid 1 on device 0 and pid 2 on device 1, API calls of pids 1 and 3.
+        let mut b = TraceBatchBuilder::default();
+        let row = |kind, pid, dev, ns| TraceRow {
+            kind: Some(kind),
+            name: "x",
+            start_ns: ns,
+            end_ns: ns + 10,
+            pid,
+            ns_pid: Some(pid),
+            device_id: dev,
+            stream_id: dev,
+            correlation_id: 1,
+            ..Default::default()
+        };
+        b.push(&row(EventKind::Kernel, 1, Some(0), 1000));
+        b.push(&row(EventKind::Kernel, 2, Some(1), 2000));
+        b.push(&row(EventKind::Runtime, 1, None, 3000));
+        b.push(&row(EventKind::Runtime, 3, None, 4000));
+        let batch = b.finish().expect("batch");
+        let wo = WriteOptions { row_group_rows: 1024, ..WriteOptions::trace() };
+        let mut t = TableWriter::new(store.writer(h, TRACE_EXT), PathBuf::from(store.location()), trace_schema(), &wo).expect("writer");
+        t.write(&batch).expect("write");
+        t.finish().expect("finish").finish(&span_name((1000, 4010), TRACE_EXT)).expect("publish");
+
+        let files = rt.block_on(files::list(&store)).expect("list");
+        let picked: Vec<Object> = files.iter().map(StoredFile::object).collect();
+        let out_dir = tempfile::tempdir().expect("tempdir");
+        let out = Store::open(&out_dir.path().display().to_string()).expect("out");
+        let ranks = Ranks::parse("0").expect("rank");
+        let (scan, written, _) = write(Format::Parquet, &store, h, &picked, &[], (0, 5000), &out, "rank0.parquet", Some(&ranks)).expect("dump");
+        let written = written.expect("rows");
+        assert_eq!(scan.rows, 2, "the device-0 kernel and pid 1's API call, nothing else");
+        let (_, _, batches) = open_reader(Path::new(&written.shown)).expect("read back");
+        let rows: Vec<(u32, Option<u32>, i64)> = batches
+            .flat_map(|b| {
+                let b = b.expect("batch");
+                use arrow_array::Array;
+                use arrow_array::cast::AsArray;
+                use arrow_array::types::{Int64Type, UInt32Type};
+                let pid = b.column_by_name("pid").expect("pid").as_primitive::<UInt32Type>().clone();
+                let dev = b.column_by_name("device_id").expect("device").as_primitive::<UInt32Type>().clone();
+                let start = b.column_by_name("start_ns").expect("start").as_primitive::<Int64Type>().clone();
+                (0..b.num_rows()).map(move |i| (pid.value(i), if dev.is_valid(i) { Some(dev.value(i)) } else { None }, start.value(i)))
+            })
+            .collect();
+        assert_eq!(rows, vec![(1, None, 3000), (1, Some(0), 1000)], "sorted by pid, device (nulls first), start");
     }
 
     #[test]
