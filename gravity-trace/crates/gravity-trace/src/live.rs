@@ -53,6 +53,8 @@ struct ShardOut {
     /// Processes with activity on a rank-filter device (mapper.ranks), resolved to host pids: their API
     /// calls (no device of their own) belong to the trace. Empty when no rank filter runs.
     sel_pids: Vec<u32>,
+    /// gpu uuid -> cudevice_ordinal as the shard learned it so far (for the trace files' footers).
+    gpu_devs: Vec<([u8; 16], u32)>,
     pending: usize,
     stats: MapStats,
     /// The snapshot manifest's flags (the same in every shard).
@@ -87,6 +89,7 @@ impl Sink for ShardSink {
                 gpus: m.gpus.iter().map(|(u, (_, d))| (*u, d.clone())).collect(),
                 pm: std::mem::take(&mut m.pm),
                 sel_pids: m.rank_pids(),
+                gpu_devs: m.gpu_devs(),
                 pending: m.pending(),
                 stats: m.stats.clone(),
                 history_truncated: m.diag.history_truncated,
@@ -168,6 +171,8 @@ struct LiveSink {
     /// seen on the selected devices (`sel_pids`, cumulative) pass too.
     ranks: Option<Ranks>,
     sel_pids: rustc_hash::FxHashSet<u32>,
+    /// gpu uuid -> cudevice_ordinal, learned from every shard's activity rows (for the trace files' footers).
+    gpu_dev: BTreeMap<[u8; 16], u32>,
 }
 
 /// Time the SDK stopped reading the service before this snapshot's successor could start.
@@ -270,7 +275,8 @@ impl LiveSink {
             let Some(o) = o else { continue };
             // Names first: the writers name tracks when their first rows arrive.
             let gpus = o.gpus.into_iter().filter(|(u, d)| self.gpus.get(u) != Some(d)).collect();
-            let names = feed::Names { procs: self.new_processes(o.procs), gpus };
+            let gpu_devs = o.gpu_devs.into_iter().filter(|(u, d)| self.gpu_dev.get(u) != Some(d)).collect();
+            let names = feed::Names { procs: self.new_processes(o.procs), gpus, gpu_devs };
             self.send_names(names);
             self.sel_pids.extend(o.sel_pids);
             for a in o.acts {
@@ -300,7 +306,7 @@ impl LiveSink {
         }
         // Titles change while a process runs (vLLM names a worker `VLLM::Worker`, then `VLLM::Worker_TP0`).
         let retitled = self.retitle();
-        self.send_names(feed::Names { procs: retitled, gpus: Vec::new() });
+        self.send_names(feed::Names { procs: retitled, gpus: Vec::new(), gpu_devs: Vec::new() });
         self.publish(pm, flags.unwrap_or_default(), job.stall_ns);
         for f in &mut self.feeds {
             f.snapshot_done();
@@ -355,6 +361,7 @@ impl LiveSink {
         }
         self.procs.extend(names.procs.into_iter().map(|p| (p.pid, p)));
         self.gpus.extend(names.gpus);
+        self.gpu_dev.extend(names.gpu_devs);
     }
 
     /// Start the capture requested since the last merge (one at a time).
@@ -371,7 +378,8 @@ impl LiveSink {
     fn close_capture(&mut self, truncated: bool) {
         let Some(r) = self.recorder.take() else { return };
         let pending = self.last.iter().flatten().map(|(_, p)| p).sum();
-        r.close(pending, self.procs.values().cloned().collect(), truncated);
+        let gpu_devs = self.gpu_dev.iter().map(|(&u, &d)| (u, d)).collect();
+        r.close(pending, self.procs.values().cloned().collect(), gpu_devs, truncated);
     }
 
     /// The pipeline stopped: close the open capture, finish the writers (persisted file, Flight SQL stream), refuse
@@ -642,6 +650,7 @@ pub async fn start(cfg: PipelineConfig) -> Result<Pipeline> {
         host_proc: cfg.host_proc.clone(),
         ranks: cfg.ranks.clone(),
         sel_pids: Default::default(),
+        gpu_dev: BTreeMap::new(),
     };
     let (tx, rx) = mpsc::sync_channel::<MergeJob>(4);
     let merger = std::thread::Builder::new()

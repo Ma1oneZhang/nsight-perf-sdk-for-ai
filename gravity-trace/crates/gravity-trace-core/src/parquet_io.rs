@@ -23,7 +23,7 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -341,6 +341,30 @@ pub fn filter_rank(batch: &RecordBatch, f: &RankFilter, path: &Path) -> Result<R
     arrow_select::filter::filter_record_batch(batch, &mask).context(ArrowSnafu { context: format!("filtering {}", path.display()) })
 }
 
+/// The PM samples of a rank selection: rows whose `gpu_uuid` is in `rank_uuids` (uuid -> how the GPU is named,
+/// `rank <device>`, from the files' [`crate::chrome::GPUS_META`] footers), with their `gpu_uuid` rewritten to
+/// the name. Samples of other / unknown GPUs are dropped.
+pub fn filter_pm_rank(batch: &RecordBatch, rank_uuids: &FxHashMap<String, String>, path: &Path) -> Result<RecordBatch> {
+    use arrow_array::{Array, BooleanArray, StringArray};
+    let uuid = batch
+        .column_by_name("gpu_uuid")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .context(WrongTableSnafu { path: path.to_path_buf(), expected: "pm", column: "gpu_uuid" })?;
+    let mut names = Vec::with_capacity(uuid.len());
+    let mask: BooleanArray = (0..uuid.len())
+        .map(|i| {
+            let name = rank_uuids.get(uuid.value(i));
+            names.push(name.cloned().unwrap_or_default());
+            Some(name.is_some())
+        })
+        .collect();
+    let idx = batch.schema().index_of("gpu_uuid").context(ArrowSnafu { context: "renaming the PM GPUs".to_string() })?;
+    let mut cols: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+    cols[idx] = std::sync::Arc::new(StringArray::from(names));
+    let named = RecordBatch::try_new(batch.schema(), cols).context(ArrowSnafu { context: "renaming the PM GPUs of a batch".to_string() })?;
+    arrow_select::filter::filter_record_batch(&named, &mask).context(ArrowSnafu { context: format!("filtering {}", path.display()) })
+}
+
 /// `batch` with the columns (by name) and types of `schema`: files written by other versions may order or type
 /// columns differently.
 pub fn conform(batch: &RecordBatch, schema: &SchemaRef, path: &Path) -> Result<RecordBatch> {
@@ -537,6 +561,33 @@ mod tests {
         .expect("batch");
         let mut pids = FxHashSet::default();
         assert!(matches!(collect_rank_pids(&bad, &[0], &mut pids, path), Err(crate::error::Error::WrongTable { .. })));
+    }
+
+    #[test]
+    fn pm_rank_filter_names_the_selected_gpus() {
+        use arrow_array::{Float64Array, Int64Array, StringArray};
+        use std::sync::Arc;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("gpu_uuid", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("end_ns", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("value", arrow_schema::DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["aaa", "aaa", "bbb", "ccc"])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float64Array::from(vec![0.1, 0.2, 0.3, 0.4])),
+            ],
+        )
+        .expect("batch");
+        let rank_uuids = FxHashMap::from_iter([("aaa".to_string(), "rank 0".to_string()), ("bbb".to_string(), "rank 2".to_string())]);
+        let out = filter_pm_rank(&batch, &rank_uuids, Path::new("pm.parquet")).expect("filter");
+        assert_eq!(out.num_rows(), 3, "ccc's device is unknown: dropped");
+        let uuid = out.column_by_name("gpu_uuid").expect("uuid").as_any().downcast_ref::<arrow_array::StringArray>().expect("string");
+        assert_eq!(uuid.iter().flatten().collect::<Vec<_>>(), vec!["rank 0", "rank 0", "rank 2"]);
+        let t = out.column_by_name("end_ns").expect("end").as_primitive::<Int64Type>().clone();
+        assert_eq!(t.values().as_ref(), &[1, 2, 3], "rows kept in order");
     }
 
     #[test]

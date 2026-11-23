@@ -163,9 +163,13 @@ struct Writer {
     rt: Handle,
     cur: Option<Current>,
     stats: Arc<PersistStats>,
-    /// Every process and GPU name so far (a new Perfetto file starts with them).
-    names: (BTreeMap<u32, ProcessInfo>, BTreeMap<[u8; 16], String>),
+    /// Every process and GPU name so far (a new Perfetto file starts with them), and the GPUs' CUDA devices
+    /// (for the trace files' footers: `gravity-trace.gpus`).
+    names: KnownNames,
 }
+
+/// `(processes by pid, GPU names by uuid, the GPUs' CUDA devices by uuid)` as learned so far.
+type KnownNames = (BTreeMap<u32, ProcessInfo>, BTreeMap<[u8; 16], String>, BTreeMap<[u8; 16], u32>);
 
 impl Writer {
     fn run(&mut self, rx: mpsc::Receiver<Msg>) {
@@ -192,6 +196,7 @@ impl Writer {
                 Ok(Msg::Names(n)) => {
                     self.names.0.extend(n.procs.iter().map(|p| (p.pid, p.clone())));
                     self.names.1.extend(n.gpus.iter().cloned());
+                    self.names.2.extend(n.gpu_devs.iter().cloned());
                     if let Some(Current { file: Open::Perfetto(p), .. }) = self.cur.as_mut()
                         && let Err(e) = p.names(&n)
                     {
@@ -240,6 +245,7 @@ impl Writer {
                     let names = Names {
                         procs: self.names.0.values().cloned().collect(),
                         gpus: self.names.1.iter().map(|(u, d)| (*u, d.clone())).collect(),
+                        gpu_devs: Vec::new(),
                     };
                     Open::Perfetto(Box::new(PerfettoWriter::new(store, rt, &names, o.gzip_level)?))
                 }
@@ -298,6 +304,7 @@ impl Writer {
         let (trace, pm, ext) = match cur.file {
             Open::Parquet { mut trace, pm } => {
                 trace.set_processes(self.names.0.values().cloned().collect());
+                trace.set_gpu_devices(self.names.2.iter().map(|(&u, &d)| (u, d)).collect());
                 let t = trace.close(None);
                 let p = if self.opts.pm { write_pm(&self.store, &self.rt, &pm, None) } else { Ok(None) };
                 (t, p, TRACE_EXT)
@@ -508,7 +515,7 @@ mod tests {
         o.format = PersistFormat::Perfetto;
         let (mut feed, control, thread) = start(o, rt.handle()).expect("start");
         let procs = vec![ProcessInfo { pid: 1, ns_pid: 1, exe: "/bin/app".to_string(), title: String::new() }];
-        feed.names(&Names { procs, gpus: vec![([7; 16], "NVIDIA Test GPU".to_string())] });
+        feed.names(&Names { procs, gpus: vec![([7; 16], "NVIDIA Test GPU".to_string())], gpu_devs: Vec::new() });
         let api = Activity { kind: EventKind::Driver, name: Arc::from("cuLaunchKernel"), tid: Some(5), device: None, stream: None, ..act(900) };
         feed.push(act(1_000));
         feed.push(api);

@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use futures::StreamExt;
-use gravity_trace_core::parquet_io::{RankFilter, conform, filter_range, filter_rank, footer_meta, leaf_mask, row_groups_in_range};
+use gravity_trace_core::parquet_io::{RankFilter, conform, filter_pm_rank, filter_range, filter_rank, footer_meta, leaf_mask, row_groups_in_range};
 use object_store::path::Path as ObjPath;
 use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
@@ -231,7 +231,8 @@ pub struct Scan {
 /// The batches of Parquet objects in a store, optionally only the rows whose Int64 `filter.0` lies in
 /// `[filter.1, filter.2)` (row groups outside it are not fetched), conformed to `schema`: what `gt dump` copies and the
 /// Perfetto converter reads ([`gravity_trace_core::chrome::BatchSource`]). `columns` reads only those leaf columns;
-/// `rank` keeps only the rows of the selected CUDA devices and their processes (`gt dump --rank`).
+/// `rank` keeps only the rows of the selected CUDA devices and their processes, `pm_rank` keeps only the PM samples of
+/// those devices and renames their GPUs (`gt dump --rank`).
 pub struct Batches<'a> {
     pub store: &'a Store,
     pub rt: &'a Handle,
@@ -240,6 +241,8 @@ pub struct Batches<'a> {
     pub schema: Option<SchemaRef>,
     pub columns: Option<&'a [&'a str]>,
     pub rank: Option<&'a RankFilter>,
+    /// PM samples of the rank selection only (`gt dump --rank`): uuid -> how its GPU is named (`rank <device>`).
+    pub pm_rank: Option<&'a rustc_hash::FxHashMap<String, String>>,
     pub scan: Scan,
 }
 
@@ -272,6 +275,13 @@ impl Batches<'_> {
                 }
                 let b = match &self.rank {
                     Some(rf) => filter_rank(&b, rf, &label).context(CoreSnafu)?,
+                    None => b,
+                };
+                if b.num_rows() == 0 {
+                    continue;
+                }
+                let b = match &self.pm_rank {
+                    Some(pm) => filter_pm_rank(&b, pm, &label).context(CoreSnafu)?,
                     None => b,
                 };
                 if b.num_rows() == 0 {

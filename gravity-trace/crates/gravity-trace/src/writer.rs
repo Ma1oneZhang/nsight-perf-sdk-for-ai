@@ -21,7 +21,7 @@ use {
     crate::feed::Names,
     crate::mapper::{Activity, PmSample},
     crate::store::{Object, ObjectWriter},
-    gravity_trace_core::chrome::{PROCESSES_META, StreamWriter},
+    gravity_trace_core::chrome::{GPUS_META, PROCESSES_META, StreamWriter},
     gravity_trace_core::model::ProcessInfo,
     gravity_trace_core::parquet_io::{TableWriter, WriteOptions},
     gravity_trace_core::schema::{TraceBatchBuilder, trace_schema},
@@ -86,6 +86,8 @@ pub struct TraceWriter {
     span: Option<(i64, i64)>,
     /// Written to the footer ([`PROCESSES_META`]) when the file is closed.
     processes: Vec<ProcessInfo>,
+    /// Its GPUs' CUDA devices, written to the footer ([`GPUS_META`]) when the file is closed.
+    gpu_devices: Vec<([u8; 16], u32)>,
 }
 
 #[cfg(feature = "monitor")]
@@ -106,12 +108,19 @@ impl TraceWriter {
             rows: 0,
             span: None,
             processes: Vec::new(),
+            gpu_devices: Vec::new(),
         }
     }
 
     /// The processes of the file (their names for `gt dump perfetto`), recorded in its footer.
     pub fn set_processes(&mut self, processes: Vec<ProcessInfo>) {
         self.processes = processes;
+    }
+
+    /// Its GPUs' CUDA devices (uuid, cudevice_ordinal), recorded in its footer: `gt dump --rank` filters and
+    /// names PM samples by them.
+    pub fn set_gpu_devices(&mut self, gpu_devices: Vec<([u8; 16], u32)>) {
+        self.gpu_devices = gpu_devices;
     }
 
     pub fn push(&mut self, a: &Activity) -> Result<()> {
@@ -159,6 +168,10 @@ impl TraceWriter {
         if !self.processes.is_empty() {
             // a list of plain structs: serializing cannot fail
             t.append_metadata(PROCESSES_META, serde_json::to_string(&self.processes).unwrap_or_default());
+        }
+        if !self.gpu_devices.is_empty() {
+            let gpus: Vec<(String, u32)> = self.gpu_devices.iter().map(|(u, d)| (nvt::uuid_string(u), *d)).collect();
+            t.append_metadata(GPUS_META, serde_json::to_string(&gpus).unwrap_or_default());
         }
         let sink = t.finish().context(CoreSnafu)?;
         let (name, bytes) = (span_name(span, TRACE_EXT), sink.bytes());
@@ -332,7 +345,7 @@ pub fn write_chrome_from(store: &Store, rt: &Handle, src: &mut Batches<'_>, pm: 
 pub fn write_chrome(store: &Store, rt: &Handle, trace: &Written) -> Result<Written> {
     let stem = trace.name.strip_suffix(TRACE_EXT).unwrap_or(&trace.name);
     let objects = [Object { name: trace.name.clone(), size: trace.bytes }];
-    let mut src = Batches { store, rt, objects: &objects, filter: None, schema: None, columns: None, rank: None, scan: Default::default() };
+    let mut src = Batches { store, rt, objects: &objects, filter: None, schema: None, columns: None, rank: None, pm_rank: None, scan: Default::default() };
     write_chrome_from(store, rt, &mut src, None, &format!("{stem}{CHROME_EXT}"))
 }
 

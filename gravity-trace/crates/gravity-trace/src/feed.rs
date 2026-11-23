@@ -38,6 +38,8 @@ impl Queue {
 pub struct Names {
     pub procs: Vec<gravity_trace_core::model::ProcessInfo>,
     pub gpus: Vec<([u8; 16], String)>,
+    /// gpu uuid -> cudevice_ordinal (from the activity rows), for the trace files' footers (`gravity-trace.gpus`).
+    pub gpu_devs: Vec<([u8; 16], u32)>,
 }
 
 pub enum Msg {
@@ -98,7 +100,7 @@ impl Feed {
     }
 
     pub fn names(&mut self, n: &Names) {
-        if !n.procs.is_empty() || !n.gpus.is_empty() {
+        if !n.procs.is_empty() || !n.gpus.is_empty() || !n.gpu_devs.is_empty() {
             let _ = self.tx.send(Msg::Names(n.clone()));
         }
     }

@@ -425,6 +425,9 @@ struct Plan {
 
 /// Footer metadata key of trace files: the JSON list of their [`ProcessInfo`]s.
 pub const PROCESSES_META: &str = "processes";
+/// Footer metadata key of trace files: `[[uuid, cudevice_ordinal], ...]` of the GPUs seen (learned from the
+/// activity rows, so only GPUs with activity are listed). `gt dump --rank` filters and names PM samples by it.
+pub const GPUS_META: &str = "gpus";
 
 fn plan(src: &mut dyn BatchSource) -> Result<Plan> {
     let mut p = Plan { base_ns: i64::MAX, ..Default::default() };

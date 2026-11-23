@@ -92,6 +92,7 @@ pub fn import(dir: &Path, out: &str, o: &ImportOptions) -> Result<ImportReport> 
     }
     let ImportSink { mapper: m, mut out, .. } = sink;
     out.set_processes(m.procs.values().cloned().collect());
+    out.set_gpu_devices(m.gpu_devs());
     let events = out.rows();
     let decode_s = t0.elapsed().as_secs_f64();
     // Named by the span of the rows: `<first start>-<last end>.parquet` (UTC ns).

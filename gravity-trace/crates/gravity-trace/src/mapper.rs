@@ -708,6 +708,12 @@ impl Mapper {
         self.rank_sel.iter().map(|&p| self.pid(p)).collect()
     }
 
+    /// The gpu uuid -> cudevice_ordinal map learned from the GPU activity rows so far (written to the trace
+    /// files' footers: `gt dump --rank` filters and names PM samples by it).
+    pub fn gpu_devs(&self) -> Vec<([u8; 16], u32)> {
+        self.rank_dev.iter().map(|(&u, &d)| (u, d)).collect()
+    }
+
     /// The pid in the process's own PID namespace.
     fn ns_pid(&self, puid: u64) -> u32 {
         self.procs.get(&puid).map(|p| p.ns_pid).unwrap_or(puid as u32)

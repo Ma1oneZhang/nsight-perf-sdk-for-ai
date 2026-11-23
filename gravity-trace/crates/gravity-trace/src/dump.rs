@@ -15,11 +15,11 @@ use crate::ranks::Ranks;
 use crate::store::{Batches, Object, ObjectWriter, Scan, Store};
 use crate::timefmt::{fmt_span, fmt_utc, now_ns, parse_time};
 use crate::writer::{CHROME_EXT, PM_EXT, TRACE_EXT, Written, pm_schema, span_name, write_chrome_from};
-use gravity_trace_core::chrome::PROCESSES_META;
+use gravity_trace_core::chrome::{GPUS_META, PROCESSES_META};
 use gravity_trace_core::model::ProcessInfo;
 use gravity_trace_core::parquet_io::{RankFilter, TableWriter, WriteOptions, collect_rank_pids};
 use gravity_trace_core::schema::trace_schema;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use snafu::{OptionExt, ResultExt, ensure};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -261,10 +261,21 @@ async fn post(addr: &str, path: &str) -> std::result::Result<String, String> {
 
 type Dumped = (Scan, Option<Written>, Option<(Written, u64)>);
 
-/// The processes with GPU activity on the selected devices in `range`, over a pid / device projection of the
-/// picked files (their API calls, which carry no device, belong to the dump too).
-fn select_pids(src: &Store, rt: &Handle, traces: &[Object], range: (i64, i64), ranks: &Ranks) -> Result<FxHashSet<u32>> {
+/// What a dump with `--rank` keeps, learned from the picked trace files and their footers.
+struct RankSelection {
+    /// The trace rows (GPU rows of the devices, their processes' API calls).
+    trace: RankFilter,
+    /// The PM samples of the selected devices: uuid -> how its GPU is named in the output (`rank <device>`).
+    /// None when no trace file carried the gpu -> device mapping (files from before it was recorded): the PM
+    /// samples then pass through unchanged.
+    pm: Option<FxHashMap<String, String>>,
+}
+
+/// The processes with GPU activity on the selected devices in `range` (their API calls, which carry no device,
+/// belong to the dump too) and the GPUs' device ids from the files' footers — over a pid / device projection.
+fn select_ranks(src: &Store, rt: &Handle, traces: &[Object], range: (i64, i64), ranks: &Ranks) -> Result<RankSelection> {
     let mut pids = FxHashSet::default();
+    let mut dev_of: FxHashMap<String, u32> = FxHashMap::default();
     let mut b = Batches {
         store: src,
         rt,
@@ -273,13 +284,29 @@ fn select_pids(src: &Store, rt: &Handle, traces: &[Object], range: (i64, i64), r
         schema: None,
         columns: Some(&["pid", "device_id", "start_ns"]),
         rank: None,
+        pm_rank: None,
         scan: Scan::default(),
     };
-    b.each(|path, _, batch| {
+    b.each(|path, meta, batch| {
         collect_rank_pids(&batch, ranks.devices(), &mut pids, path).context(CoreSnafu)?;
+        if let Some(j) = meta.get(GPUS_META) {
+            let list: Vec<(String, u32)> = serde_json::from_str(j).unwrap_or_default();
+            dev_of.extend(list);
+        }
         Ok(())
     })?;
-    Ok(pids)
+    let trace = RankFilter { devices: ranks.devices().to_vec(), pids };
+    let pm = match dev_of.is_empty() {
+        true => None,
+        false => Some(
+            dev_of
+                .into_iter()
+                .filter(|(_, d)| ranks.devices().contains(d))
+                .map(|(u, d)| (u, format!("rank {d}")))
+                .collect(),
+        ),
+    };
+    Ok(RankSelection { trace, pm })
 }
 
 /// Write the dump (on a blocking thread: the stores are driven through `rt`).
@@ -301,10 +328,16 @@ fn write(
         ("dump_end_utc_ns".to_string(), range.1.to_string()),
         ("host".to_string(), crate::host()),
     ]);
-    let rank = match ranks {
-        Some(r) => Some(RankFilter { devices: r.devices().to_vec(), pids: select_pids(src, rt, traces, range, r)? }),
+    let sel = match ranks {
+        Some(r) => Some(select_ranks(src, rt, traces, range, r)?),
         None => None,
     };
+    if let Some(s) = &sel
+        && s.pm.is_none()
+        && !pms.is_empty()
+    {
+        eprintln!("gt dump: warning: the trace files carry no gpu -> device mapping (written before it was recorded): PM samples are kept, unfiltered");
+    }
     let mut batches = Batches {
         store: src,
         rt,
@@ -312,7 +345,8 @@ fn write(
         filter: Some(("start_ns", range.0, range.1)),
         schema: Some(trace_schema()),
         columns: None,
-        rank: rank.as_ref(),
+        rank: sel.as_ref().map(|s| &s.trace),
+        pm_rank: None,
         scan: Scan::default(),
     };
     let written = match format {
@@ -329,6 +363,7 @@ fn write(
                 schema: Some(pm_schema()),
                 columns: None,
                 rank: None,
+                pm_rank: sel.as_ref().and_then(|s| s.pm.as_ref()),
                 scan: Scan::default(),
             };
             let pm_opt: Option<&mut Batches<'_>> = if pms.is_empty() { None } else { Some(&mut pm_batches) };
@@ -353,6 +388,7 @@ fn write(
             schema: Some(pm_schema()),
             columns: None,
             rank: None,
+            pm_rank: sel.as_ref().and_then(|s| s.pm.as_ref()),
             scan: Scan::default(),
         };
         let opts = WriteOptions { metadata: meta, ..WriteOptions::default() };
@@ -514,21 +550,68 @@ mod tests {
         b.push(&row(EventKind::Runtime, 1, None, 3000));
         b.push(&row(EventKind::Runtime, 3, None, 4000));
         let batch = b.finish().expect("batch");
-        let wo = WriteOptions { row_group_rows: 1024, ..WriteOptions::trace() };
+        let mut wo = WriteOptions { row_group_rows: 1024, ..WriteOptions::trace() };
+        wo.metadata.insert("gpus".into(), serde_json::to_string(&[("aaa", 0u32), ("bbb", 1u32)]).expect("json"));
         let mut t = TableWriter::new(store.writer(h, TRACE_EXT), PathBuf::from(store.location()), trace_schema(), &wo).expect("writer");
         t.write(&batch).expect("write");
         t.finish().expect("finish").finish(&span_name((1000, 4010), TRACE_EXT)).expect("publish");
+        // And its PM samples: "aaa" (device 0) and "bbb" (device 1).
+        {
+            use arrow_array::builder::StringDictionaryBuilder;
+            use arrow_array::{Float64Array, Int64Array, StringArray};
+            use arrow_array::types::Int32Type;
+            use std::sync::Arc;
+            let mut metric = StringDictionaryBuilder::<Int32Type>::new();
+            for _ in 0..3 {
+                metric.append_value("m");
+            }
+            let samples = arrow_array::RecordBatch::try_new(
+                pm_schema(),
+                vec![
+                    Arc::new(StringArray::from(vec!["aaa", "bbb", "ccc"])),
+                    Arc::new(Int64Array::from(vec![1500, 2500, 3500])),
+                    Arc::new(metric.finish()),
+                    Arc::new(Float64Array::from(vec![0.1, 0.2, 0.3])),
+                ],
+            )
+            .expect("pm batch");
+            let mut t = TableWriter::new(store.writer(h, PM_EXT), PathBuf::from(store.location()), pm_schema(), &WriteOptions::default()).expect("pm writer");
+            t.write(&samples).expect("write");
+            t.finish().expect("finish").finish(&span_name((1500, 3500), PM_EXT)).expect("publish");
+        }
 
         let files = rt.block_on(files::list(&store)).expect("list");
-        let picked: Vec<Object> = files.iter().map(StoredFile::object).collect();
+        let picked: Vec<Object> = files.iter().filter(|f| f.kind == FileKind::Trace).map(StoredFile::object).collect();
+        let pms: Vec<Object> = files.iter().filter(|f| f.kind == FileKind::Pm).map(StoredFile::object).collect();
+        assert_eq!((picked.len(), pms.len()), (1, 1));
         let out_dir = tempfile::tempdir().expect("tempdir");
         let out = Store::open(&out_dir.path().display().to_string()).expect("out");
         let ranks = Ranks::parse("0").expect("rank");
-        let (scan, written, _) = write(Format::Parquet, &store, h, &picked, &[], (0, 5000), &out, "rank0.parquet", Some(&ranks)).expect("dump");
+        let (scan, written, pm) =
+            write(Format::Parquet, &store, h, &picked, &pms, (0, 5000), &out, "rank0.parquet", Some(&ranks)).expect("dump");
         let written = written.expect("rows");
         assert_eq!(scan.rows, 2, "the device-0 kernel and pid 1's API call, nothing else");
-        let (_, _, batches) = open_reader(Path::new(&written.shown)).expect("read back");
-        let rows: Vec<(u32, Option<u32>, i64)> = batches
+        let rows = trace_rows(Path::new(&written.shown));
+        assert_eq!(rows, vec![(1, None, 3000), (1, Some(0), 1000)], "sorted by pid, device (nulls first), start");
+
+        // The PM samples: only "aaa" (device 0), renamed to "rank 0"; "ccc" has no known device.
+        let (pm_written, pm_rows) = pm.expect("pm file");
+        assert_eq!(pm_rows, 1);
+        let (_, _, batches) = open_reader(Path::new(&pm_written.shown)).expect("read pm");
+        let names: Vec<String> = batches
+            .flat_map(|b| {
+                let b = b.expect("batch");
+                let u = b.column_by_name("gpu_uuid").expect("uuid").as_any().downcast_ref::<arrow_array::StringArray>().expect("string").clone();
+                (0..b.num_rows()).map(move |i| u.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, ["rank 0"], "the device's PM samples, named by its rank");
+    }
+
+    /// (pid, device_id, start_ns) of a trace file's rows.
+    fn trace_rows(p: &Path) -> Vec<(u32, Option<u32>, i64)> {
+        let (_, _, batches) = open_reader(p).expect("read back");
+        batches
             .flat_map(|b| {
                 let b = b.expect("batch");
                 use arrow_array::Array;
@@ -539,8 +622,7 @@ mod tests {
                 let start = b.column_by_name("start_ns").expect("start").as_primitive::<Int64Type>().clone();
                 (0..b.num_rows()).map(move |i| (pid.value(i), if dev.is_valid(i) { Some(dev.value(i)) } else { None }, start.value(i)))
             })
-            .collect();
-        assert_eq!(rows, vec![(1, None, 3000), (1, Some(0), 1000)], "sorted by pid, device (nulls first), start");
+            .collect()
     }
 
     #[test]

@@ -139,9 +139,11 @@ GT_DAEMON_LISTEN=                                   # "" is a value (no HTTP ser
   (today), and the end also `+5m`. When the range reaches past the newest file and the daemon is running, the daemon
   is asked to close its open file first; the last snapshot interval is not merged yet.
 - **`--rank 0,2,3`** restricts a dump to these ranks (the trace's `device_id`, the SDK's `cudevice_ordinal`,
-  comma-separated): the GPU activities on those devices, and the API calls of the processes seen running on them
-  (a pid scan of the picked files first, reading only the `pid` / `device_id` columns). PM samples are per GPU and
-  are not filtered.
+  comma-separated): the GPU activities on those devices, the API calls of the processes seen running on them
+  (a pid scan of the picked files first, reading only the `pid` / `device_id` columns), and the PM samples of
+  those GPUs, with their `gpu_uuid` rewritten to `rank <device>`. The gpu -> device mapping is read from the
+  trace files' footers (`gravity-trace.gpus`); files written before it was recorded pass the PM samples through
+  unchanged (with a warning).
 
 Measured with `bench/daemon_check.sh` (GPU cluster, service on 2 GPUs, synthetic CUDA-graph load on one GPU at ~770 K
 activities/s for 75 s, `max_cpus = 4`, `rotate_s = 20`):
@@ -172,9 +174,10 @@ renamed once complete.
 - **Perfetto** (`<start>-<end>.json.gz`): [Perfetto](#perfetto). Captures write one next to their Parquet files
   (`--no-chrome`, or `chrome=false` on `POST /capture`, skips it).
 - **Footers** carry `gravity-trace.host`, `gravity-trace.processes` (JSON `[{pid, ns_pid, exe, title}]`, which
-  `gt dump perfetto` names the tracks by), `gravity-trace.source` and `gravity-trace.tsf_dir` (import),
-  `capture_start_utc_ns` / `capture_end_utc_ns` (live capture: the activities that start in that window) or
-  `dump_start_utc_ns` / `dump_end_utc_ns` (dump).
+  `gt dump perfetto` names the tracks by), `gravity-trace.gpus` (JSON `[[uuid, cudevice_ordinal], ...]` of the
+  GPUs with activity, which `gt dump --rank` filters and names PM samples by), `gravity-trace.source` and
+  `gravity-trace.tsf_dir` (import), `capture_start_utc_ns` / `capture_end_utc_ns` (live capture: the activities
+  that start in that window) or `dump_start_utc_ns` / `dump_end_utc_ns` (dump).
 - **Prometheus** (`gt exporter`, `gt export-daemon`): per-process series with the
   process labels `pid, ns_pid, exe, title` (`nvtrace_activity_count_total`, `nvtrace_activity_seconds_total`,
   `nvtrace_gpu_kernel_busy_seconds_total`, p50 / p99, ...), snapshot health

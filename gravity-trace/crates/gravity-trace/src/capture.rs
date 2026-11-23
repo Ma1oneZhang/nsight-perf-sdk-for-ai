@@ -52,7 +52,7 @@ pub struct CaptureReport {
 enum ToWriter {
     Rows(Vec<Activity>),
     Pm(Vec<PmSample>),
-    Close { snapshots: u64, pending: usize, processes: Vec<ProcessInfo>, truncated: bool },
+    Close { snapshots: u64, pending: usize, processes: Vec<ProcessInfo>, gpu_devs: Vec<([u8; 16], u32)>, truncated: bool },
 }
 
 /// The merge thread's side of a running capture.
@@ -126,12 +126,12 @@ impl Recorder {
     }
 
     /// Let the writer thread finish the files and answer the request.
-    pub fn close(self, pending: usize, processes: Vec<ProcessInfo>, truncated: bool) {
+    pub fn close(self, pending: usize, processes: Vec<ProcessInfo>, gpu_devs: Vec<([u8; 16], u32)>, truncated: bool) {
         let rows = self.rows;
         if !rows.is_empty() {
             let _ = self.tx.send(ToWriter::Rows(rows));
         }
-        let _ = self.tx.send(ToWriter::Close { snapshots: self.snapshots, pending, processes, truncated });
+        let _ = self.tx.send(ToWriter::Close { snapshots: self.snapshots, pending, processes, gpu_devs, truncated });
     }
 }
 
@@ -172,14 +172,14 @@ impl WriterJob {
                     }
                 }
                 ToWriter::Pm(s) => pm.extend(s),
-                ToWriter::Close { snapshots, pending, processes, truncated } => {
-                    close = Some((snapshots, pending, processes, truncated));
+                ToWriter::Close { snapshots, pending, processes, gpu_devs, truncated } => {
+                    close = Some((snapshots, pending, processes, gpu_devs, truncated));
                     break;
                 }
             }
         }
         // The merge thread went away without closing: the pipeline stopped.
-        let (snapshots, pending_at_close, processes, truncated) = close.unwrap_or((0, 0, Vec::new(), true));
+        let (snapshots, pending_at_close, processes, gpu_devs, truncated) = close.unwrap_or((0, 0, Vec::new(), Vec::new(), true));
         if snapshots == 0 && out.rows() == 0 && truncated {
             return CaptureAbortedSnafu.fail();
         }
@@ -188,6 +188,7 @@ impl WriterJob {
         // Named by the window: `<start>-<end>.parquet` (UTC ns).
         let window = Some((self.start as i64, self.end as i64));
         out.set_processes(processes.clone());
+        out.set_gpu_devices(gpu_devs);
         let trace = out.close(window)?;
         let pm_file = write_pm(&store, &self.rt, &pm, window)?.map(|w| w.shown);
         let chrome = match (&trace, self.chrome) {
@@ -255,7 +256,12 @@ mod tests {
         r.offer(&act(1_900));
         assert!(!r.snapshot_done(1_800, 3_000), "this snapshot started inside the window");
         assert!(r.snapshot_done(3_000, 4_000), "a snapshot after the window closes the capture");
-        r.close(0, vec![ProcessInfo { pid: 1, ns_pid: 1, exe: "proc".to_string(), title: String::new() }], false);
+        r.close(
+            0,
+            vec![ProcessInfo { pid: 1, ns_pid: 1, exe: "proc".to_string(), title: String::new() }],
+            vec![([7; 16], 0u32)],
+            false,
+        );
         let rep = rx.blocking_recv().expect("reply").expect("capture");
         assert_eq!(rep.rows, 4, "1000, 1500, 1999 and the late 1900");
         assert_eq!(rep.snapshots, 3);
@@ -265,6 +271,8 @@ mod tests {
         assert_eq!(rep.chrome, Some(format!("{}/1000-2000.json.gz", dir.path().display())));
         let (_, meta, batches) = open_reader(&trace).expect("read back");
         assert_eq!(meta.get("capture_start_utc_ns").map(String::as_str), Some("1000"));
+        let gpus: Vec<(String, u32)> = serde_json::from_str(meta.get("gpus").expect("gpus footer")).expect("json");
+        assert_eq!(gpus, vec![("GPU-07070707-0707-0707-0707-070707070707".to_string(), 0)], "uuid -> device footer");
         let n: usize = batches.map(|b| b.expect("batch").num_rows()).sum();
         assert_eq!(n, 4);
     }

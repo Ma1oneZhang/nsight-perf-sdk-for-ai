@@ -151,7 +151,8 @@ enum Cmd {
         #[arg(short, long, env = "GT_CONFIG")]
         config: Option<PathBuf>,
         /// Only these ranks (CUDA device ids, comma-separated: 0,2,3): their GPU activities and the API calls of
-        /// the processes running on them. PM samples are per GPU and not filtered.
+        /// the processes running on them; PM samples are filtered to those GPUs and their `gpu_uuid` rewritten to
+        /// `rank N` (from the trace files' footer map; files from before it was recorded keep their PM samples as-is).
         #[arg(long)]
         rank: Option<String>,
         /// Leave the PM samples out (the `.pm.parquet` of a Parquet dump, the counter tracks of a Perfetto one).
